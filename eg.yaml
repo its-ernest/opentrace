@@ -1,0 +1,11 @@
+# track.yaml
+modules:
+  - name: ip_locator
+    input: "8.8.8.8"
+    config:
+      token: "${IPINFO_TOKEN}"
+
+  - name: social_patterns
+    input: "$ip_locator"      # receives ip_locator's output string
+    config:
+      depth: 2

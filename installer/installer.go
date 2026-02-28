@@ -272,4 +272,4 @@ func readManifest(path string) (*Manifest, error) {
 		return nil, fmt.Errorf("manifest missing required fields: name and version")
 	}
 	return &m, nil
-}
+} 

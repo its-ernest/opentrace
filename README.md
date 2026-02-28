@@ -33,7 +33,14 @@ The core does not interpret results. It does not cluster, score, or display anyt
 
 Requires Go 1.22+.
 ```bash
+#Reliable install
+GOPROXY=direct go install github.com/its-ernest/opentrace/cmd/opentrace@latest
+
+#Or simply
 go install github.com/its-ernest/opentrace/cmd/opentrace@latest
+
+#Specific verrsion
+GOPROXY=direct go install github.com/its-ernest/opentrace/cmd/opentrace@v0.1.4
 ```
 
 Or build from source:
@@ -207,6 +214,7 @@ entity_types: [ip]   # ip | email | username | domain | phone | text | url
 Anyone can install your module directly from your repo without any approval:
 ```bash
 opentrace install github.com/you/opentrace-your-module
+
 ```
 
 To list it in the official registry so it is discoverable by name,

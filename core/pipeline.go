@@ -29,36 +29,46 @@ func Load(path string) (*Pipeline, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot read pipeline %q: %w", path, err)
 	}
+
 	var p Pipeline
 	if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(data))), &p); err != nil {
 		return nil, fmt.Errorf("invalid pipeline YAML: %w", err)
 	}
+
 	if len(p.Modules) == 0 {
 		return nil, fmt.Errorf("pipeline has no modules")
 	}
+
 	return &p, nil
 }
 
 func Run(ctx context.Context, p *Pipeline, binDir string) error {
-	// outputs holds each module's result string, keyed by module name
 	outputs := make(map[string]string)
 
 	for _, step := range p.Modules {
-		// Resolve input — if starts with $ it's a reference to a prior output
 		input := step.Input
+
 		if strings.HasPrefix(input, "$") {
 			ref := strings.TrimPrefix(input, "$")
 			val, ok := outputs[ref]
 			if !ok {
-				return fmt.Errorf("module %q references output of %q but it hasn't run yet", step.Name, ref)
+				return fmt.Errorf(
+					"module %q references output of %q but it hasn't run yet",
+					step.Name,
+					ref,
+				)
 			}
 			input = val
 		}
 
-		result, err := runModule(ctx, filepath.Join(binDir, step.Name), sdk.Input{
-			Input:  input,
-			Config: step.Config,
-		})
+		result, err := runModule(
+			ctx,
+			filepath.Join(binDir, step.Name),
+			sdk.Input{
+				Input:  input,
+				Config: step.Config,
+			},
+		)
 		if err != nil {
 			return fmt.Errorf("[%s] %w", step.Name, err)
 		}
@@ -77,42 +87,31 @@ func runModule(ctx context.Context, binPath string, in sdk.Input) (string, error
 
 	cmd := exec.CommandContext(ctx, binPath)
 	cmd.Stdin = bytes.NewReader(payload)
-	cmd.Stdout = os.Stdout // module prints directly to terminal
-	cmd.Stderr = os.Stderr
 
-	// needs both passthrough and capture of stdout for piping.
-	// using a custom writer that tees to stdout and a buffer.
-	var buf bytes.Buffer
-	tee := &teeWriter{w: os.Stdout, buf: &buf}
-	cmd.Stdout = tee
+	// 🔑 stdout = machine data only
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	// 🔑 stderr = logs / prints
+	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("exited with error: %w", err)
 	}
 
-	// Extract result field from the module's JSON output
+	raw := bytes.TrimSpace(stdout.Bytes())
+	if len(raw) == 0 {
+		return "", fmt.Errorf("module produced no output")
+	}
+
 	var out sdk.Output
-	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
-		// Module may print non-JSON lines before the final JSON — find last line
-		lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
-		for i := len(lines) - 1; i >= 0; i-- {
-			if err2 := json.Unmarshal([]byte(lines[i]), &out); err2 == nil {
-				return out.Result, nil
-			}
-		}
-		return "", fmt.Errorf("could not parse output JSON: %w", err)
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf(
+			"module output is not valid JSON: %w\nraw output:\n%s",
+			err,
+			string(raw),
+		)
 	}
 
 	return out.Result, nil
-}
-
-// teeWriter writes to both a passthrough writer and an internal buffer.
-type teeWriter struct {
-	w   *os.File
-	buf *bytes.Buffer
-}
-
-func (t *teeWriter) Write(p []byte) (int, error) {
-	t.buf.Write(p)
-	return t.w.Write(p)
 }

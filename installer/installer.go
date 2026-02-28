@@ -12,28 +12,21 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const (
-	modulesRepo   = "https://github.com/its-ernest/opentrace-modules"
-	modulesPrefix = "modules"
-)
+const registryRepo = "https://github.com/its-ernest/opentrace-modules"
 
 type Manifest struct {
 	Name        string   `yaml:"name"`
 	Version     string   `yaml:"version"`
 	Description string   `yaml:"description"`
 	Author      string   `yaml:"author"`
-	Official    bool     `yaml:"official"`
-	Verified    bool     `yaml:"verified"`
 	EntityTypes []string `yaml:"entity_types"`
-	Repo        string   `yaml:"repo"`
 }
 
 type RegistryEntry struct {
-	BinPath  string `json:"bin_path"`
-	Version  string `json:"version"`
-	Author   string `json:"author"`
-	Official bool   `json:"official"`
-	Verified bool   `json:"verified"`
+	BinPath string `json:"bin_path"`
+	Version string `json:"version"`
+	Author  string `json:"author"`
+	Repo    string `json:"repo"`
 }
 
 type Registry map[string]RegistryEntry
@@ -59,86 +52,93 @@ func saveRegistry(r Registry) error {
 }
 
 // Install is the single entry point.
-// Detects whether the argument is a name (official) or a repo path (external).
+//
+// Two forms accepted:
+//   opentrace install ip_locator                              → looks up name in opentrace-modules registry
+//   opentrace install github.com/user/repo                   → clones directly from that repo
 func Install(arg string) error {
 	if err := os.MkdirAll(BinDir(), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 
-	if isExternalRepo(arg) {
-		return installExternal(arg)
+	if isRepoPath(arg) {
+		return installFromRepo(arg)
 	}
-	return installOfficial(arg)
+	return installFromRegistry(arg)
 }
 
-// isExternalRepo returns true if the argument looks like a repo path.
-// e.g. github.com/alice/opentrace-face-osint
-func isExternalRepo(arg string) bool {
+// isRepoPath returns true if arg looks like a repo path (contains a slash).
+func isRepoPath(arg string) bool {
 	return strings.Contains(arg, "/")
 }
 
-// installOfficial fetches from opentrace-modules using sparse checkout.
-func installOfficial(name string) error {
+// installFromRegistry looks up the module name in opentrace-modules/registry.json
+// then delegates to installFromRepo using the registered repo URL.
+func installFromRegistry(name string) error {
 	tmp, err := os.MkdirTemp("", "opentrace-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmp)
 
-	fmt.Printf("  fetching %s from opentrace-modules...\n", name)
+	fmt.Printf("  looking up %s in registry...\n", name)
 
-	sparseDir := filepath.Join(modulesPrefix, name)
-
+	// sparse clone just the registry.json
 	if out, err := exec.Command("git", "clone",
 		"--depth=1", "--filter=blob:none", "--sparse",
-		modulesRepo, tmp,
+		registryRepo, tmp,
 	).CombinedOutput(); err != nil {
 		return fmt.Errorf("git clone: %s: %w", string(out), err)
 	}
 
 	if out, err := exec.Command("git", "-C", tmp,
-		"sparse-checkout", "set", sparseDir,
+		"sparse-checkout", "set", "registry.json",
 	).CombinedOutput(); err != nil {
 		return fmt.Errorf("sparse-checkout: %s: %w", string(out), err)
 	}
 
-	moduleDir := filepath.Join(tmp, modulesPrefix, name)
-	if _, err := os.Stat(moduleDir); os.IsNotExist(err) {
-		return fmt.Errorf("module %q not found in opentrace-modules", name)
-	}
-
-	version, err := latestVersion(moduleDir)
+	// read registry.json
+	regData, err := os.ReadFile(filepath.Join(tmp, "registry.json"))
 	if err != nil {
-		return fmt.Errorf("no versions found for %q: %w", name, err)
+		return fmt.Errorf("cannot read registry.json from opentrace-modules: %w", err)
 	}
 
-	srcDir := filepath.Join(moduleDir, version)
-
-	manifest, err := readManifest(filepath.Join(srcDir, "manifest.yaml"))
-	if err != nil {
-		return fmt.Errorf("manifest: %w", err)
+	// registry.json is map[name]repo_url
+	var index map[string]string
+	if err := json.Unmarshal(regData, &index); err != nil {
+		return fmt.Errorf("invalid registry.json: %w", err)
 	}
 
-	printManifest(manifest)
+	repoURL, ok := index[name]
+	if !ok {
+		return fmt.Errorf(
+			"module %q not found in registry\n\n"+
+				"  if this is a third-party module, install it directly:\n"+
+				"  opentrace install github.com/<user>/%s\n",
+			name, name,
+		)
+	}
 
-	// official modules are always verified — no prompt needed
-	return build(name, version, srcDir, manifest, true)
+	fmt.Printf("  found %s → %s\n", name, repoURL)
+	return installFromRepo(repoURL)
 }
 
-// installExternal clones a community repo, reads its manifest, prompts if unverified.
-// arg is the full repo path e.g. github.com/alice/opentrace-face-osint
-func installExternal(arg string) error {
-	// derive module name from last path segment
-	// github.com/alice/opentrace-face-osint → opentrace-face-osint
-	// then strip opentrace- prefix if present for the bin name
-	repoName := arg[strings.LastIndex(arg, "/")+1:]
-	name := strings.TrimPrefix(repoName, "opentrace-")
-
-	repoURL := "https://" + arg
-	// handle if they already passed https://
-	if strings.HasPrefix(arg, "https://") {
-		repoURL = arg
+// installFromRepo clones a repo directly and builds the module.
+// arg can be:
+//   github.com/user/repo
+//   https://github.com/user/repo
+func installFromRepo(arg string) error {
+	// normalize to full URL
+	repoURL := arg
+	if !strings.HasPrefix(arg, "https://") && !strings.HasPrefix(arg, "http://") {
+		repoURL = "https://" + arg
 	}
+
+	// derive a local name from the last path segment
+	// github.com/user/opentrace-face-osint → face-osint
+	// github.com/user/contacts_graph_extract → contacts_graph_extract
+	lastSegment := arg[strings.LastIndex(arg, "/")+1:]
+	localName := strings.TrimPrefix(lastSegment, "opentrace-")
 
 	tmp, err := os.MkdirTemp("", "opentrace-*")
 	if err != nil {
@@ -146,67 +146,67 @@ func installExternal(arg string) error {
 	}
 	defer os.RemoveAll(tmp)
 
-	fmt.Printf("  fetching %s...\n", arg)
+	fmt.Printf("  cloning %s...\n", repoURL)
 
 	if out, err := exec.Command("git", "clone",
 		"--depth=1", repoURL, tmp,
 	).CombinedOutput(); err != nil {
-		return fmt.Errorf("git clone: %s: %w", string(out), err)
+		return fmt.Errorf("git clone failed: %s: %w", string(out), err)
 	}
 
-	// manifest must be at root of the repo
+	// read manifest from root of repo
 	manifest, err := readManifest(filepath.Join(tmp, "manifest.yaml"))
 	if err != nil {
 		return fmt.Errorf("manifest: %w", err)
 	}
 
-	// use manifest name as the canonical module name if available
+	// manifest name takes priority over derived name
 	if manifest.Name != "" {
-		name = manifest.Name
+		localName = manifest.Name
 	}
 
-	printManifest(manifest)
+	printManifest(manifest, repoURL)
 
-	// external repos are always unverified unless explicitly marked
-	if !manifest.Verified {
-		fmt.Printf("  ⚠  %s is unverified (community module). Install anyway? (y/n): ", name)
-		var confirm string
-		fmt.Scan(&confirm)
-		if confirm != "y" {
-			fmt.Println("  aborted.")
-			return nil
-		}
+	// always prompt — no module is pre-trusted
+	fmt.Printf("  install %s? (y/n): ", localName)
+	var confirm string
+	fmt.Scan(&confirm)
+	if strings.ToLower(confirm) != "y" {
+		fmt.Println("  aborted.")
+		return nil
 	}
 
-	return build(name, manifest.Version, tmp, manifest, false)
+	return build(localName, tmp, manifest, repoURL)
 }
 
-// build compiles the module source and registers it.
-func build(name, version, srcDir string, manifest *Manifest, official bool) error {
+// build compiles the module and registers it locally.
+func build(name, srcDir string, manifest *Manifest, repo string) error {
 	binName := name
 	if runtime.GOOS == "windows" {
 		binName += ".exe"
 	}
 	binPath := filepath.Join(BinDir(), binName)
 
-	fmt.Printf("  building %s@%s...\n", name, version)
-	if out, err := exec.Command("go", "build", "-trimpath", "-o", binPath, srcDir).CombinedOutput(); err != nil {
-		return fmt.Errorf("build failed: %s: %w", string(out), err)
+	fmt.Printf("  building %s@%s...\n", name, manifest.Version)
+
+	if out, err := exec.Command(
+		"go", "build", "-trimpath", "-o", binPath, srcDir,
+	).CombinedOutput(); err != nil {
+		return fmt.Errorf("build failed:\n%s", string(out))
 	}
 
 	reg := LoadRegistry()
 	reg[name] = RegistryEntry{
-		BinPath:  binPath,
-		Version:  manifest.Version,
-		Author:   manifest.Author,
-		Official: official,
-		Verified: manifest.Verified,
+		BinPath: binPath,
+		Version: manifest.Version,
+		Author:  manifest.Author,
+		Repo:    repo,
 	}
 	if err := saveRegistry(reg); err != nil {
 		return fmt.Errorf("save registry: %w", err)
 	}
 
-	fmt.Printf("  ✓ %s@%s installed → %s\n", name, version, binPath)
+	fmt.Printf("  ✓ %s@%s installed → %s\n", name, manifest.Version, binPath)
 	return nil
 }
 
@@ -228,18 +228,12 @@ func List() {
 		return
 	}
 	fmt.Println()
-	fmt.Printf("  %-22s  %-10s  %-16s  %s\n", "MODULE", "VERSION", "AUTHOR", "STATUS")
-	fmt.Printf("  %-22s  %-10s  %-16s  %s\n",
-		"──────────────────────", "─────────", "───────────────", "──────────")
+	fmt.Printf("  %-26s  %-10s  %-16s  %s\n", "MODULE", "VERSION", "AUTHOR", "REPO")
+	fmt.Printf("  %-26s  %-10s  %-16s  %s\n",
+		"──────────────────────────", "─────────", "───────────────", "────────────────────────────────")
 	for name, entry := range reg {
-		status := "unverified"
-		if entry.Official {
-			status = "official"
-		} else if entry.Verified {
-			status = "verified"
-		}
-		fmt.Printf("  %-22s  %-10s  %-16s  %s\n",
-			name, entry.Version, entry.Author, status)
+		fmt.Printf("  %-26s  %-10s  %-16s  %s\n",
+			name, entry.Version, entry.Author, entry.Repo)
 	}
 	fmt.Println()
 }
@@ -255,38 +249,20 @@ func BinPath(name string) (string, error) {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-func printManifest(m *Manifest) {
+func printManifest(m *Manifest, repo string) {
 	fmt.Println()
 	fmt.Printf("  name        : %s\n", m.Name)
 	fmt.Printf("  version     : %s\n", m.Version)
 	fmt.Printf("  author      : %s\n", m.Author)
 	fmt.Printf("  description : %s\n", m.Description)
-	fmt.Printf("  official    : %v\n", m.Official)
-	fmt.Printf("  verified    : %v\n", m.Verified)
+	fmt.Printf("  repo        : %s\n", repo)
 	fmt.Println()
-}
-
-func latestVersion(moduleDir string) (string, error) {
-	entries, err := os.ReadDir(moduleDir)
-	if err != nil {
-		return "", err
-	}
-	var versions []string
-	for _, e := range entries {
-		if e.IsDir() {
-			versions = append(versions, e.Name())
-		}
-	}
-	if len(versions) == 0 {
-		return "", fmt.Errorf("no version directories found")
-	}
-	return versions[len(versions)-1], nil
 }
 
 func readManifest(path string) (*Manifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read manifest at %q: %w", path, err)
+		return nil, fmt.Errorf("cannot read manifest.yaml at repo root: %w", err)
 	}
 	var m Manifest
 	if err := yaml.Unmarshal(data, &m); err != nil {

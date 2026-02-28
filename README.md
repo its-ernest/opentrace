@@ -259,6 +259,15 @@ The only contract between them is stdin and stdout.
 
 ---
 
+## Uninstall opentrace
+```bash
+# remove the binary
+rm $(which opentrace)
+
+# remove all installed modules + registry
+rm -rf ~/.opentrace
+```
+
 ## License
 
 Mozilla Public License Version 2.0
